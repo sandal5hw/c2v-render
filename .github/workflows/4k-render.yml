@@ -60,6 +60,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sandal5/c2v
+          token: ""
           ref: john
 
       # Chunks and the film move through R2 now — fail in 1 minute if
@@ -158,6 +159,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sandal5/c2v
+          token: ""
           ref: john
 
       - name: Check disk and ffmpeg
