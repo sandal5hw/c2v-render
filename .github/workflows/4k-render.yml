@@ -1,0 +1,330 @@
+name: Render 4K (generic)
+# run-name 带上分集：codev 观察窗口靠它认出这个 run 是哪一集的。
+run-name: ${{ inputs.episode }} · 4K 正片
+
+# Generic 4K finished-film render, triggered by codev dispatch only
+# (2026-11-26: moved to sandal5hw/c2v-render; code is checked out from
+# sandal5/c2v@john at runtime). on: workflow_dispatch, inputs:
+# episode (required, e.g. SC008) and stage (e.g. motion). Resolves
+# projects/<episode>-*/ from the episode id, reads durationInFrames
+# from its timeline/render-props.json, and renders in 9 parallel
+# ~2000-frame chunks at 4K (scale 2.0, crf 18), then concatenates
+# with ffmpeg -c copy.
+# Standing rule: 4K always renders in chunks — a single job exceeds
+# the 6h Actions cap (AS001 hit it at 13952/16035 frames) and local
+# runs die on VM restarts.
+# codev dispatches here with ref: main; the render code comes from
+# sandal5/c2v branch john (see the checkout steps).
+# Chunk transfer goes through the codev R2 bucket, NOT Actions
+# artifacts (jo, 2026-11-25): the film is ~650 MB however it is
+# sliced, and the free Actions storage quota is 0.5 GB total. Each
+# chunk job uploads renders/<episode>/<run_id>/chunk-NN.mp4 to R2;
+# the concat job pulls them from R2, concatenates in Actions, uploads
+# the finished film to R2 as <episode>/<ProjectDir>-4K.mp4, registers
+# it in codev as the film deliverable, then deletes the scratch
+# chunks. No artifact of the film or its chunks is kept.
+
+on:
+  workflow_dispatch:
+    inputs:
+      episode:
+        description: "Episode id, e.g. SC008"
+        required: true
+        type: string
+      stage:
+        description: "Stage that approved this render, e.g. motion"
+        required: false
+        default: "motion"
+        type: string
+
+concurrency:
+  # 样片、正片同时只能做一个（jo，2026-11-25）：全仓库渲染共用一个
+  # 并发组，一个在跑、其余排队；queue: max 保证排队的单不被后来者
+  # 顶掉（默认 single 只留最后一个等待者，会丢派发）。
+  group: c2v-render
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.chunks.outputs.matrix }}
+      episode: ${{ steps.resolve.outputs.episode }}
+      project_dir: ${{ steps.resolve.outputs.project_dir }}
+      project_name: ${{ steps.resolve.outputs.project_name }}
+      total_frames: ${{ steps.chunks.outputs.total_frames }}
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      # Chunks and the film move through R2 now — fail in 1 minute if
+      # the R2 credentials are missing instead of after 8 renders.
+      - name: Preflight R2 credentials
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ID: ${{ secrets.R2_TOKEN_ID }}
+          DIR_TOKEN: ${{ secrets.DIRECTOR_TOKEN }}
+        run: |
+          if [ -z "$CF_TOKEN" ] || [ -z "$CF_ACCOUNT" ] || [ -z "$R2_ID" ]; then
+            echo "::error::Missing CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID and/or R2_TOKEN_ID in sandal5/c2v repo secrets — chunks and the film are delivered via R2 (S3), cannot proceed."
+            exit 1
+          fi
+          if [ -z "$DIR_TOKEN" ]; then
+            echo "::warning::DIRECTOR_TOKEN missing — the film will land on R2 but cannot be registered in codev automatically."
+          fi
+          echo "R2 credentials present."
+
+      # 光有凭据不够：权限不对时所有 chunk 会全渲完才在上传步失败
+      # （2026-11-25 SC008 实测，整点渲染全废）。setup 先做一次真写
+      # 探针：写一个小文件再删掉，写不进 1 分钟内就失败。
+      # 上传走 S3 协议（aws cli）：凭据 = R2 令牌（对象读写、限
+      # codev 桶）——Access Key ID 是令牌 ID（secret R2_TOKEN_ID），
+      # Secret 按 Cloudflare 规则由令牌值（CLOUDFLARE_API_TOKEN）
+      # 做 SHA-256 现场算出。wrangler 的 REST 传法只认管理员令牌，
+      # 不用它。
+      - name: Probe R2 write access
+        env:
+          CF_TOKEN_VALUE: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_TOKEN_ID }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          export AWS_SECRET_ACCESS_KEY="$(printf %s "$CF_TOKEN_VALUE" | sha256sum | cut -d' ' -f1)"
+          KEY="renders/_probe/${{ github.run_id }}.txt"
+          echo "probe" > probe.txt
+          if ! aws s3 cp probe.txt "s3://codev/$KEY" --endpoint-url "$R2_ENDPOINT"; then
+            echo "::error::R2 write probe (S3) failed — check R2_TOKEN_ID and CLOUDFLARE_API_TOKEN (the object read/write R2 token for bucket codev). Rendering has NOT started yet."
+            exit 1
+          fi
+          aws s3 rm "s3://codev/$KEY" --endpoint-url "$R2_ENDPOINT" || true
+          echo "R2 write probe (S3) OK."
+
+      - name: Resolve project dir
+        id: resolve
+        run: |
+          set -euo pipefail
+          EPISODE="${{ inputs.episode || 'SC008' }}"
+          echo "episode=$EPISODE" >> "$GITHUB_OUTPUT"
+          DIRS=(projects/$EPISODE-*/)
+          if [ ${#DIRS[@]} -ne 1 ] || [ ! -d "${DIRS[0]}" ]; then
+            echo "No unique project dir for episode $EPISODE: ${DIRS[*]}" >&2
+            exit 1
+          fi
+          DIR="${DIRS[0]%/}"
+          echo "project_dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "project_name=$(basename "$DIR")" >> "$GITHUB_OUTPUT"
+          echo "Resolved $DIR"
+          test -f "$DIR/timeline/render-props.json" || { echo "No render-props.json in $DIR" >&2; exit 1; }
+          test -f "$DIR/voice/master.wav" || { echo "No voice/master.wav in $DIR" >&2; exit 1; }
+
+      - name: Compute chunk matrix
+        id: chunks
+        run: |
+          python3 - "${{ steps.resolve.outputs.project_dir }}" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, math, sys
+          props = json.load(open(f"{sys.argv[1]}/timeline/render-props.json"))
+          total = int(props["durationInFrames"])
+          n = 9
+          size = math.ceil(total / n)
+          chunks = []
+          for i in range(n):
+              start = i * size
+              if start >= total:
+                  break
+              end = min(start + size - 1, total - 1)
+              chunks.append({"id": f"{i:02d}", "frames": f"{start}-{end}", "count": end - start + 1})
+          print(f"total_frames={total}")
+          print(f"matrix={json.dumps({'include': chunks})}")
+          EOF
+          cat "$GITHUB_OUTPUT"
+
+  render-chunk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Check disk and ffmpeg
+        run: |
+          df -h
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.18.3"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install headless Chrome for Remotion
+        run: npx remotion browser install
+
+      # render-public is gitignored (symlinks + master.wav hard link, built locally).
+      # Rebuild it on the runner the same way: assets symlinks, media symlink,
+      # master.wav copied from the committed voice dir.
+      - name: Rebuild render-public
+        run: |
+          set -euo pipefail
+          DIR="${{ needs.setup.outputs.project_dir }}"
+          mkdir -p "$DIR/render-public"
+          cd "$DIR/render-public"
+          ln -s ../../../assets/audio audio
+          ln -s ../../../assets/fonts fonts
+          ln -s ../../../assets/images images
+          ln -s ../research-package/media media
+          cp ../voice/master.wav master.wav
+          ls -la
+          test -f master.wav && echo "master.wav ok"
+          test -n "$(ls media)" && echo "media resolves ($(ls media | wc -l) files)"
+
+      # 码率按系列标准 12M（总则）：不用 CRF——CRF 18 的 4K 单块超
+      # 300 MiB，撞 wrangler 单文件上传上限（2026-11-25 SC008 实测
+      # chunk-00 渲完死在上传步）。12M 时单块约 100 MB，全片约 800 MB。
+      - name: Render chunk ${{ matrix.id }} (frames ${{ matrix.frames }})
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR" output
+          ./node_modules/.bin/remotion render src/renderer/index.ts Documentary output/chunk-${{ matrix.id }}.mp4 --props=${{ needs.setup.outputs.project_dir }}/timeline/render-props.json --public-dir=${{ needs.setup.outputs.project_dir }}/render-public --scale=2.0 --video-bitrate=12M --concurrency=2 --frames=${{ matrix.frames }}
+
+      - name: Verify chunk
+        run: |
+          ls -la output/chunk-${{ matrix.id }}.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 output/chunk-${{ matrix.id }}.mp4
+
+      # Chunk goes straight to R2 scratch (renders/<episode>/<run_id>/),
+      # never to an Actions artifact — see header note.
+      - name: Upload chunk to R2
+        env:
+          CF_TOKEN_VALUE: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_TOKEN_ID }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          export AWS_SECRET_ACCESS_KEY="$(printf %s "$CF_TOKEN_VALUE" | sha256sum | cut -d' ' -f1)"
+          KEY="renders/${{ needs.setup.outputs.episode }}/${{ github.run_id }}/chunk-${{ matrix.id }}.mp4"
+          echo "Uploading chunk to R2 codev/$KEY"
+          aws s3 cp "output/chunk-${{ matrix.id }}.mp4" "s3://codev/$KEY" --endpoint-url "$R2_ENDPOINT" --content-type video/mp4
+          echo "Uploaded: codev/$KEY"
+
+  # Concatenate in Actions, upload the finished film to R2 and register
+  # it in codev as the film deliverable, then delete the scratch chunks.
+  # The film is 1GB+, so it must NOT go through the Worker's raw-body
+  # upload endpoint (size limit) and must NOT be committed to git.
+  concat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [setup, render-chunk]
+    steps:
+      - name: Check ffmpeg
+        run: |
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download chunks from R2
+        env:
+          CF_TOKEN_VALUE: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_TOKEN_ID }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          MATRIX: ${{ needs.setup.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          export AWS_SECRET_ACCESS_KEY="$(printf %s "$CF_TOKEN_VALUE" | sha256sum | cut -d' ' -f1)"
+          mkdir -p chunks
+          PREFIX="renders/${{ needs.setup.outputs.episode }}/${{ github.run_id }}"
+          for id in $(python3 -c "import json,os; print(' '.join(c['id'] for c in json.loads(os.environ['MATRIX'])['include']))"); do
+            echo "Downloading chunk $id from R2 codev/$PREFIX/chunk-$id.mp4"
+            aws s3 cp "s3://codev/$PREFIX/chunk-$id.mp4" "chunks/chunk-$id.mp4" --endpoint-url "$R2_ENDPOINT"
+          done
+          ls -la chunks/
+
+      - name: Concatenate and verify
+        run: |
+          : > concat-list.txt
+          for f in $(ls chunks/chunk-*.mp4 | sort); do
+            echo "file '$f'" >> concat-list.txt
+          done
+          cat concat-list.txt
+          mkdir -p output
+          ffmpeg -y -f concat -safe 0 -i concat-list.txt -c copy "output/${{ needs.setup.outputs.project_name }}-4K.mp4"
+          ls -la "output/${{ needs.setup.outputs.project_name }}-4K.mp4"
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries stream=codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 "output/${{ needs.setup.outputs.project_name }}-4K.mp4"
+
+      - name: Upload 4K film to codev R2
+        env:
+          CF_TOKEN_VALUE: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_TOKEN_ID }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          export AWS_SECRET_ACCESS_KEY="$(printf %s "$CF_TOKEN_VALUE" | sha256sum | cut -d' ' -f1)"
+          FILE="output/${{ needs.setup.outputs.project_name }}-4K.mp4"
+          KEY="${{ needs.setup.outputs.episode }}/${{ needs.setup.outputs.project_name }}-4K.mp4"
+          echo "Uploading $FILE to R2 codev/$KEY"
+          ls -la "$FILE"
+          aws s3 cp "$FILE" "s3://codev/$KEY" --endpoint-url "$R2_ENDPOINT" --content-type video/mp4
+          echo "Film on R2: codev/$KEY"
+
+      - name: Register film asset in codev
+        run: |
+          set -euo pipefail
+          KEY="${{ needs.setup.outputs.episode }}/${{ needs.setup.outputs.project_name }}-4K.mp4"
+          curl -sS -f -X POST "https://codev.nbfun.com/api/episodes/${{ needs.setup.outputs.episode }}/assets" \
+            -H "Authorization: Bearer ${{ secrets.DIRECTOR_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data-raw "{\"kind\":\"film\",\"r2_key\":\"$KEY\",\"label\":\"4K 正片 (${{ needs.setup.outputs.project_name }}-4K.mp4)\"}"
+          echo "Registered film asset in codev: $KEY"
+
+      # Scratch chunks are only deleted after the film is safely on R2
+      # and registered; on any earlier failure they stay for a re-run of
+      # just this job (same run_id → same scratch prefix).
+      - name: Delete scratch chunks from R2
+        env:
+          CF_TOKEN_VALUE: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_TOKEN_ID }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          MATRIX: ${{ needs.setup.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          export AWS_SECRET_ACCESS_KEY="$(printf %s "$CF_TOKEN_VALUE" | sha256sum | cut -d' ' -f1)"
+          PREFIX="renders/${{ needs.setup.outputs.episode }}/${{ github.run_id }}"
+          for id in $(python3 -c "import json,os; print(' '.join(c['id'] for c in json.loads(os.environ['MATRIX'])['include']))"); do
+            aws s3 rm "s3://codev/$PREFIX/chunk-$id.mp4" --endpoint-url "$R2_ENDPOINT"
+          done
+          echo "Scratch chunks deleted: codev/$PREFIX/"

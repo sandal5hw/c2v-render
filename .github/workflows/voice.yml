@@ -1,0 +1,203 @@
+name: Voice (generic)
+
+# Generic voiceover production, dispatched by codev when an episode's
+# script step is approved (NEXT_STAGE_MAP: script -> voice.yml).
+# Inputs: episode (codev episode id, e.g. SH001-Starfish or SC008) and
+# stage (the approving stage, "script").
+#
+# What it does:
+#   1. Resolve the narration text: the project's own
+#      voice/tts-script.txt if it exists (hand-crafted, wins), else
+#      extract from script.md (project script/ or research-package/,
+#      else the script asset registered in codev) via
+#      scripts/extract_narration.py — the package's 「TTS 合成文本」
+#      section first, the storyboard table's narration column as
+#      fallback.
+#   2. Run scripts/fish_tts.py (Fish Audio, sandal voice) ->
+#      master.wav + timing.tsv. Fish key: FISH_API_KEY repo secret if set,
+#      otherwise fetched at runtime from the codev Worker (FISH_AUDIO).
+#      without it the job fails with a clear message.
+#   3. Upload master.wav / timing.tsv / tts-script.txt to codev
+#      (kind=voice) through the Worker upload endpoint
+#      (DIRECTOR_TOKEN secret).
+#   4. Advance the episode in codev (voice -> sample), which
+#      dispatches sample-render.yml for the next hop.
+# Lives on john only — never main. codev dispatches with ref: john.
+
+on:
+  # Dispatch-only (2026-11-26: moved to sandal5hw/c2v-render, whose
+  # default branch hosts this file, so no push trigger is needed to
+  # register the workflow). Real work only starts from a codev dispatch.
+  workflow_dispatch:
+    inputs:
+      episode:
+        description: "Episode id, e.g. SH001-Starfish"
+        required: true
+        type: string
+      stage:
+        description: "Stage that approved this step, e.g. script"
+        required: false
+        default: "script"
+        type: string
+
+concurrency:
+  group: voice-${{ inputs.episode }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.g.outputs.proceed }}
+    steps:
+      - id: g
+        run: |
+          if [ -n "${{ inputs.episode }}" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "Push-triggered registration run (no episode input) — nothing to do."
+          fi
+
+  voice:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Check ffmpeg
+        run: |
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Resolve project and narration script
+        id: resolve
+        env:
+          DIRECTOR_TOKEN: ${{ secrets.DIRECTOR_TOKEN }}
+          EPISODE: ${{ inputs.episode }}
+        run: |
+          set -euo pipefail
+          # Project dir: exact projects/<id>, else unique projects/<id>-*/.
+          DIR=""
+          if [ -d "projects/$EPISODE" ]; then
+            DIR="projects/$EPISODE"
+          else
+            DIRS=(projects/$EPISODE-*/)
+            if [ ${#DIRS[@]} -eq 1 ] && [ -d "${DIRS[0]}" ]; then
+              DIR="${DIRS[0]%/}"
+            fi
+          fi
+          if [ -z "$DIR" ]; then
+            DIR="projects/$EPISODE"
+            mkdir -p "$DIR/voice"
+            echo "No project dir yet — scaffolding $DIR (voice only)"
+          fi
+          echo "project_dir=$DIR" >> "$GITHUB_OUTPUT"
+
+          mkdir -p "$DIR/voice" work
+          if [ -f "$DIR/voice/tts-script.txt" ]; then
+            echo "Using existing $DIR/voice/tts-script.txt"
+          else
+            SCRIPT_MD=""
+            for cand in "$DIR/script/script.md" "$DIR/research-package/script.md"; do
+              if [ -f "$cand" ]; then SCRIPT_MD="$cand"; break; fi
+            done
+            if [ -z "$SCRIPT_MD" ]; then
+              if [ -z "${DIRECTOR_TOKEN:-}" ]; then
+                echo "::error::No local script.md for $EPISODE and DIRECTOR_TOKEN is not set — cannot fetch the approved script from codev."
+                exit 1
+              fi
+              echo "Fetching approved script.md from codev…"
+              curl -sS -f "https://codev.nbfun.com/api/episodes/$EPISODE/assets" \
+                -H "Authorization: Bearer $DIRECTOR_TOKEN" -o work/assets.json
+              KEY=$(python3 -c "
+          import json
+          rows = json.load(open('work/assets.json'))
+          hit = next((r for r in rows if r.get('kind') == 'script'), None)
+          print(hit['r2_key'] if hit else '')
+          ")
+              if [ -z "$KEY" ]; then
+                echo "::error::Episode $EPISODE has no script asset in codev — nothing to narrate."
+                exit 1
+              fi
+              ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$KEY")
+              curl -sS -f "https://codev.nbfun.com/api/assets/$ENC" \
+                -H "Authorization: Bearer $DIRECTOR_TOKEN" -o work/script.md
+              SCRIPT_MD="work/script.md"
+            fi
+            echo "Extracting narration from $SCRIPT_MD"
+            python3 scripts/extract_narration.py "$SCRIPT_MD" "$DIR/voice/tts-script.txt"
+          fi
+          wc -l "$DIR/voice/tts-script.txt"
+
+      - name: Resolve Fish API key
+        env:
+          FISH_API_KEY: ${{ secrets.FISH_API_KEY }}
+          DIRECTOR_TOKEN: ${{ secrets.DIRECTOR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${FISH_API_KEY:-}" ]; then
+            echo "FISH_API_KEY present (repo secret)"
+            echo "FISH_API_KEY=${FISH_API_KEY}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "No FISH_API_KEY repo secret - fetching from the codev Worker (jo keeps the keys there)."
+          KEY=$(curl -sS -f "https://codev.nbfun.com/api/config/keys" \
+            -H "Authorization: Bearer $DIRECTOR_TOKEN" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('fish_audio') or '')")
+          if [ -z "$KEY" ]; then
+            echo "::error::No Fish Audio key available - neither the FISH_API_KEY repo secret nor the codev Worker's FISH_AUDIO is set."
+            exit 1
+          fi
+          echo "::add-mask::$KEY"
+          echo "FISH_API_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "FISH_API_KEY resolved from codev Worker"
+      - name: Generate voiceover (Fish Audio TTS)
+        run: |
+          set -euo pipefail
+          DIR="${{ steps.resolve.outputs.project_dir }}"
+          python3 scripts/fish_tts.py "$DIR/voice/tts-script.txt" "$DIR/voice"
+          ls -la "$DIR/voice/master.wav" "$DIR/voice/timing.tsv"
+
+      - name: Upload voice assets to codev
+        env:
+          DIRECTOR_TOKEN: ${{ secrets.DIRECTOR_TOKEN }}
+          EPISODE: ${{ inputs.episode }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DIRECTOR_TOKEN:-}" ]; then
+            echo "::error::DIRECTOR_TOKEN is not set in the sandal5/c2v repo secrets — cannot upload voice assets to codev."
+            exit 1
+          fi
+          DIR="${{ steps.resolve.outputs.project_dir }}"
+          upload() {
+            # $1 = file, $2 = name, $3 = content-type
+            echo "Uploading $2 ($(stat -c%s "$1") bytes)"
+            curl -sS -f -X POST "https://codev.nbfun.com/api/episodes/$EPISODE/assets/upload?kind=voice&name=$2" \
+              -H "Authorization: Bearer $DIRECTOR_TOKEN" \
+              -H "Content-Type: $3" \
+              --data-binary @"$1"
+            echo
+          }
+          upload "$DIR/voice/master.wav" "master.wav" "audio/wav"
+          upload "$DIR/voice/timing.tsv" "timing.tsv" "text/tab-separated-values"
+          upload "$DIR/voice/tts-script.txt" "tts-script.txt" "text/plain"
+
+      - name: Advance episode to sample step (dispatches sample-render)
+        env:
+          DIRECTOR_TOKEN: ${{ secrets.DIRECTOR_TOKEN }}
+          EPISODE: ${{ inputs.episode }}
+        run: |
+          set -euo pipefail
+          curl -sS -f -X POST "https://codev.nbfun.com/api/episodes/$EPISODE/advance" \
+            -H "Authorization: Bearer $DIRECTOR_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-raw '{"from_stage":"voice","decision":"approved"}'
+          echo
+          echo "Episode $EPISODE advanced: voice -> sample; sample-render.yml dispatched by codev."

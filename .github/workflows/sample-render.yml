@@ -1,0 +1,235 @@
+name: Render Sample (generic, low-res)
+# run-name 带上分集：codev 观察窗口靠它认出这个 run 是哪一集的。
+run-name: ${{ inputs.episode }} · 样片
+
+# Generic low-res sample + motion frames, dispatched by codev when an
+# episode advances into the sample step (NEXT_STAGE_MAP:
+# voice -> sample-render.yml). Inputs: episode (codev episode id) and
+# stage ("voice").
+#
+# Renders the 960x540 sample (scale 0.5, crf 26) from the episode's
+# timeline/render-props.json — same shape as the per-episode
+# render-bc001-sample / render-sc008-sample workflows, generalized:
+# resolves projects/<episode> or projects/<episode>-*/, takes the
+# frame count from render-props.json, and pulls voice/master.wav
+# from codev when the repo copy is absent (voice.yml delivers it
+# there). Then renders the per-sub-shot motion cells via
+# scripts/effects_sheet.sh and uploads sample (kind=video) + cells
+# (kind=motion, element-NNN.jpeg) to the episode's sample-motion
+# step in codev through the Worker upload endpoint.
+#
+# An episode whose project / storyboard does not exist yet fails
+# loudly with the reason — building the storyboard is production
+# work, not something a render workflow can invent.
+# Lives on john only — never main. codev dispatches with ref: john.
+
+on:
+  # Dispatch-only (2026-11-26: moved to sandal5hw/c2v-render; the file
+  # lives on the default branch there, so no push trigger is needed).
+  workflow_dispatch:
+    inputs:
+      episode:
+        description: "Episode id, e.g. SC008"
+        required: true
+        type: string
+      stage:
+        description: "Stage that approved this step, e.g. voice"
+        required: false
+        default: "voice"
+        type: string
+
+concurrency:
+  # 样片、正片同时只能做一个（jo，2026-11-25）：全仓库渲染共用一个
+  # 并发组，一个在跑、其余排队；queue: max 保证排队的单不被后来者
+  # 顶掉（默认 single 只留最后一个等待者，会丢派发）。
+  group: c2v-render
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.g.outputs.proceed }}
+    steps:
+      - id: g
+        run: |
+          if [ -n "${{ inputs.episode }}" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "Push-triggered registration run (no episode input) — nothing to do."
+          fi
+
+  render-sample:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Check disk and ffmpeg
+        run: |
+          df -h
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Resolve project dir
+        id: resolve
+        env:
+          EPISODE: ${{ inputs.episode }}
+        run: |
+          set -euo pipefail
+          DIR=""
+          if [ -d "projects/$EPISODE" ]; then
+            DIR="projects/$EPISODE"
+          else
+            DIRS=(projects/$EPISODE-*/)
+            if [ ${#DIRS[@]} -eq 1 ] && [ -d "${DIRS[0]}" ]; then
+              DIR="${DIRS[0]%/}"
+            fi
+          fi
+          if [ -z "$DIR" ]; then
+            echo "::error::No project dir for episode $EPISODE (looked for projects/$EPISODE and projects/$EPISODE-*/) — the project/storyboard has not been built yet, so there is nothing to render."
+            exit 1
+          fi
+          if [ ! -f "$DIR/timeline/render-props.json" ]; then
+            echo "::error::$DIR has no timeline/render-props.json — the storyboard/timeline has not been built yet, so there is nothing to render."
+            exit 1
+          fi
+          echo "project_dir=$DIR" >> "$GITHUB_OUTPUT"
+          TOTAL=$(python3 -c "import json; print(int(json.load(open('$DIR/timeline/render-props.json'))['durationInFrames']))")
+          echo "total_frames=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "Resolved $DIR ($TOTAL frames)"
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.18.3"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install headless Chrome for Remotion
+        run: npx remotion browser install
+
+      # render-public is gitignored (symlinks + master.wav, built locally).
+      # Rebuild it on the runner: assets symlinks, media symlink,
+      # master.wav from the committed voice dir, else from codev
+      # (voice.yml uploaded it as the episode's master.wav asset).
+      - name: Rebuild render-public
+        env:
+          DIRECTOR_TOKEN: ${{ secrets.DIRECTOR_TOKEN }}
+          EPISODE: ${{ inputs.episode }}
+        run: |
+          set -euo pipefail
+          DIR="${{ steps.resolve.outputs.project_dir }}"
+          mkdir -p "$DIR/render-public"
+          cd "$DIR/render-public"
+          ln -s ../../../assets/audio audio
+          ln -s ../../../assets/fonts fonts
+          ln -s ../../../assets/images images
+          if [ -d ../research-package/media ]; then
+            ln -s ../research-package/media media
+          fi
+          if [ -f ../voice/master.wav ]; then
+            cp ../voice/master.wav master.wav
+          elif [ -n "${DIRECTOR_TOKEN:-}" ]; then
+            echo "No repo master.wav — downloading from codev…"
+            curl -sS -f "https://codev.nbfun.com/api/assets/$EPISODE%2Fmaster.wav" \
+              -H "Authorization: Bearer $DIRECTOR_TOKEN" -o master.wav
+          fi
+          ls -la
+          test -f master.wav || { echo "::error::No voice/master.wav for $EPISODE (not in repo, not in codev) — voiceover has not been produced yet."; exit 1; }
+          echo "master.wav ok"
+
+      - name: Render sample (960x540)
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          set -euo pipefail
+          DIR="${{ steps.resolve.outputs.project_dir }}"
+          TOTAL="${{ steps.resolve.outputs.total_frames }}"
+          mkdir -p "$TMPDIR" output
+          ./node_modules/.bin/remotion render src/renderer/index.ts Documentary output/sample-lowres.mp4 --props="$DIR/timeline/render-props.json" --public-dir="$DIR/render-public" --scale=0.5 --crf=26 --frames="0-$((TOTAL-1))"
+
+      - name: Verify sample
+        run: |
+          ls -la output/sample-lowres.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 output/sample-lowres.mp4
+          md5sum output/sample-lowres.mp4
+
+      - name: Render motion cells (effects sheet script)
+        run: |
+          set -euo pipefail
+          DIR="${{ steps.resolve.outputs.project_dir }}"
+          sh scripts/effects_sheet.sh "$DIR"
+          ls "$DIR/output/sheet/cells" | head -5
+          ls "$DIR/output/sheet/cells" | wc -l
+
+      - name: Upload sample + motion cells to codev
+        env:
+          DIRECTOR_TOKEN: ${{ secrets.DIRECTOR_TOKEN }}
+          EPISODE: ${{ inputs.episode }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DIRECTOR_TOKEN:-}" ]; then
+            echo "::error::DIRECTOR_TOKEN is not set in the sandal5/c2v repo secrets — cannot upload the sample to codev."
+            exit 1
+          fi
+          DIR="${{ steps.resolve.outputs.project_dir }}"
+          echo "Uploading sample-lowres.mp4 ($(stat -c%s output/sample-lowres.mp4) bytes)"
+          curl -sS -f -X POST "https://codev.nbfun.com/api/episodes/$EPISODE/assets/upload?kind=video&name=sample-lowres.mp4" \
+            -H "Authorization: Bearer $DIRECTOR_TOKEN" \
+            -H "Content-Type: video/mp4" \
+            --data-binary @output/sample-lowres.mp4
+          echo
+          n=0
+          for cell in "$DIR"/output/sheet/cells/*.jpeg; do
+            name=$(basename "$cell")
+            curl -sS -f -X POST "https://codev.nbfun.com/api/episodes/$EPISODE/assets/upload?kind=motion&name=$name" \
+              -H "Authorization: Bearer $DIRECTOR_TOKEN" \
+              -H "Content-Type: image/jpeg" \
+              --data-binary @"$cell" > /dev/null
+            n=$((n+1))
+          done
+          echo "Uploaded sample + $n motion cells to codev episode $EPISODE (sample-motion step)."
+
+      - name: Upload sample artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.episode }}-sample
+          path: output/sample-lowres.mp4
+          retention-days: 1
+
+  # 做完就清（jo，2026-11-25）：本次运行的 artifact 在交付物进 codev
+  # 后立即删除，不等保留期——免费存储只有 0.5 GB。只在渲染成功时
+  # 清；失败时保留（保留期已改 1 天）供排查。
+  cleanup-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: render-sample
+    if: success()
+    permissions:
+      actions: write
+    steps:
+      - name: Delete this run's artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[].id' | while read -r id; do
+            echo "Deleting artifact $id"
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id"
+          done
+          echo "Artifacts cleaned for run ${{ github.run_id }}."

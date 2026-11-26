@@ -1,0 +1,124 @@
+name: Render BC001 Sample (low-res)
+
+# BC001-ThePuzzle low-res sample, 960x540 30fps.
+# v2 (2026-11-23): full redo per SC007 — m-beats/anim/board/clip via the
+# ported opus motion library (src/visuals/opus/); 63 shots, 102 beats,
+# 14775 frames unchanged, --frames=0-14774 unchanged.
+# v2 confirm-2 passed 2026-11-24 JST (9 segments expect/break added,
+# cues SFX mapped to library sounds) — this push renders sample v2.
+# v3 (2026-11-24): per main workflow/总则 — real photo/video backgrounds
+# (no screenshots as backgrounds), dots layer visible (no full-cover),
+# whip as main transition, slam landing delay, board palette aligned,
+# caption plates FROST per 总则 11, silent beats wired to library SFX.
+# render-public gains a video symlink (assets/video) for the new footage.
+# This push renders sample v3 (saved as sample-lowres-v3.mp4).
+# Local VM restarts kill long renders, so it runs here instead.
+# Single job: 14775 frames at 960x540 (scale 0.5, crf 26) — far lighter
+# than the AS001 4K chunks, so no chunking (timeout 180 min as a guard).
+# Trigger: pushing this file on john (2026-11-26: this file now lives on the
+# default branch of sandal5hw/c2v-render, so API dispatch works).
+# Output is uploaded as an Actions artifact named BC001-ThePuzzle-sample.
+# NOTE: voice/master.wav is force-added to john (gitignored by default),
+# same as AS001's 45 MB master.wav — the runner copies it into render-public.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  # 样片、正片同时只能做一个（jo，2026-11-25）：全仓库渲染共用一个
+  # 并发组，一个在跑、其余排队；queue: max 保证排队的单不被后来者
+  # 顶掉（默认 single 只留最后一个等待者，会丢派发）。
+  group: c2v-render
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  render-sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Check disk and ffmpeg
+        run: |
+          df -h
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.18.3"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install headless Chrome for Remotion
+        run: npx remotion browser install
+
+      # render-public is gitignored (symlinks + master.wav hard link, built locally).
+      # Rebuild it on the runner the same way: assets symlinks, media symlink,
+      # master.wav copied from the committed voice dir.
+      - name: Rebuild render-public
+        run: |
+          mkdir -p projects/BC001-ThePuzzle/render-public
+          cd projects/BC001-ThePuzzle/render-public
+          ln -s ../../../assets/audio audio
+          ln -s ../../../assets/fonts fonts
+          ln -s ../../../assets/images images
+          ln -s ../../../assets/video video
+          ln -s ../research-package/media media
+          cp ../voice/master.wav master.wav
+          ls -la
+          test -f media/M-001_screenshot_boinc_home_berkeley_nsf.png && echo "M-001 resolves"
+
+      - name: Render sample (14775 frames, 960x540)
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR" output
+          ./node_modules/.bin/remotion render src/renderer/index.ts Documentary output/sample-lowres.mp4 --props=projects/BC001-ThePuzzle/timeline/render-props.json --public-dir=projects/BC001-ThePuzzle/render-public --scale=0.5 --crf=26 --frames=0-14774
+
+      - name: Verify sample
+        run: |
+          ls -la output/sample-lowres.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 output/sample-lowres.mp4
+          md5sum output/sample-lowres.mp4
+
+      - name: Upload sample
+        uses: actions/upload-artifact@v4
+        with:
+          name: BC001-ThePuzzle-sample
+          path: output/sample-lowres.mp4
+          retention-days: 1
+
+  # 做完就清（jo，2026-11-25）：本次运行的 artifact 在交付物进 codev
+  # 后立即删除，不等保留期——免费存储只有 0.5 GB。只在渲染成功时
+  # 清；失败时保留（保留期已改 1 天）供排查。
+  cleanup-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: render-sample
+    if: success()
+    permissions:
+      actions: write
+    steps:
+      - name: Delete this run's artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[].id' | while read -r id; do
+            echo "Deleting artifact $id"
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id"
+          done
+          echo "Artifacts cleaned for run ${{ github.run_id }}."

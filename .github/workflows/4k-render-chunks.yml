@@ -1,0 +1,165 @@
+name: Render 4K chunks (partial)
+
+# Re-render only the requested 4K chunks of a finished film (fix pass).
+# The full 4k-render.yml always renders all 8 chunks; use this one when a
+# review fix touches only some chunks, so the unaffected chunks are reused
+# from the earlier run's artifacts and re-concatenated locally.
+# Trigger: workflow_dispatch only, inputs: episode (e.g. SC008) and chunks
+# (comma-separated chunk ids, e.g. "00,03,04,05" — the 8-chunk split from
+# 4k-render.yml: size = ceil(total/8), chunk i covers i*size .. min((i+1)*size-1, total-1)).
+# Output: one Actions artifact per requested chunk, named chunk-<id>
+# (same names as the full workflow, retention 7 days). No concat job here:
+# download the new chunks plus the unaffected old chunks from the earlier
+# run and concat with ffmpeg -c copy locally.
+# Lives on john only — never main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      episode:
+        description: "Episode id, e.g. SC008"
+        required: true
+        type: string
+      chunks:
+        description: "Comma-separated chunk ids to re-render, e.g. 00,03,04,05"
+        required: true
+        type: string
+
+concurrency:
+  # 样片、正片同时只能做一个（jo，2026-11-25）：全仓库渲染共用一个
+  # 并发组，一个在跑、其余排队；queue: max 保证排队的单不被后来者
+  # 顶掉（默认 single 只留最后一个等待者，会丢派发）。
+  group: c2v-render
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.chunks.outputs.matrix }}
+      episode: ${{ steps.resolve.outputs.episode }}
+      project_dir: ${{ steps.resolve.outputs.project_dir }}
+      project_name: ${{ steps.resolve.outputs.project_name }}
+      total_frames: ${{ steps.chunks.outputs.total_frames }}
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Resolve project dir
+        id: resolve
+        run: |
+          set -euo pipefail
+          EPISODE="${{ inputs.episode }}"
+          echo "episode=$EPISODE" >> "$GITHUB_OUTPUT"
+          DIRS=(projects/$EPISODE-*/)
+          if [ ${#DIRS[@]} -ne 1 ] || [ ! -d "${DIRS[0]}" ]; then
+            echo "No unique project dir for episode $EPISODE: ${DIRS[*]}" >&2
+            exit 1
+          fi
+          DIR="${DIRS[0]%/}"
+          echo "project_dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "project_name=$(basename "$DIR")" >> "$GITHUB_OUTPUT"
+          echo "Resolved $DIR"
+          test -f "$DIR/timeline/render-props.json" || { echo "No render-props.json in $DIR" >&2; exit 1; }
+          test -f "$DIR/voice/master.wav" || { echo "No voice/master.wav in $DIR" >&2; exit 1; }
+
+      - name: Compute requested chunk matrix
+        id: chunks
+        run: |
+          python3 - "${{ steps.resolve.outputs.project_dir }}" "${{ inputs.chunks }}" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, math, sys
+          props = json.load(open(f"{sys.argv[1]}/timeline/render-props.json"))
+          total = int(props["durationInFrames"])
+          wanted = [c.strip() for c in sys.argv[2].split(",") if c.strip()]
+          n = 8
+          size = math.ceil(total / n)
+          chunks = []
+          for i in range(n):
+              start = i * size
+              if start >= total:
+                  break
+              end = min(start + size - 1, total - 1)
+              cid = f"{i:02d}"
+              if cid in wanted:
+                  chunks.append({"id": cid, "frames": f"{start}-{end}", "count": end - start + 1})
+          if len(chunks) != len(wanted):
+              raise SystemExit(f"Requested chunks {wanted} do not all exist (total {total}, size {size})")
+          print(f"total_frames={total}")
+          print(f"matrix={json.dumps({'include': chunks})}")
+          EOF
+          cat "$GITHUB_OUTPUT"
+
+  render-chunk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Check disk and ffmpeg
+        run: |
+          df -h
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.18.3"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install headless Chrome for Remotion
+        run: npx remotion browser install
+
+      - name: Rebuild render-public
+        run: |
+          set -euo pipefail
+          DIR="${{ needs.setup.outputs.project_dir }}"
+          mkdir -p "$DIR/render-public"
+          cd "$DIR/render-public"
+          ln -s ../../../assets/audio audio
+          ln -s ../../../assets/fonts fonts
+          ln -s ../../../assets/images images
+          ln -s ../research-package/media media
+          cp ../voice/master.wav master.wav
+          ls -la
+          test -f master.wav && echo "master.wav ok"
+          test -n "$(ls media)" && echo "media resolves ($(ls media | wc -l) files)"
+
+      - name: Render chunk ${{ matrix.id }} (frames ${{ matrix.frames }})
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR" output
+          ./node_modules/.bin/remotion render src/renderer/index.ts Documentary output/chunk-${{ matrix.id }}.mp4 --props=${{ needs.setup.outputs.project_dir }}/timeline/render-props.json --public-dir=${{ needs.setup.outputs.project_dir }}/render-public --scale=2.0 --crf=18 --frames=${{ matrix.frames }}
+
+      - name: Verify chunk
+        run: |
+          ls -la output/chunk-${{ matrix.id }}.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 output/chunk-${{ matrix.id }}.mp4
+
+      - name: Upload chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.id }}
+          path: output/chunk-${{ matrix.id }}.mp4
+          retention-days: 7

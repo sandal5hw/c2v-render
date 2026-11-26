@@ -1,0 +1,176 @@
+name: Render SC008 Sample (low-res)
+
+# SC008-HawkEye360 low-res sample, 960x540 30fps.
+# Local VM restarts kill long renders, so it runs here instead.
+# Single job: 15900 frames at 960x540 (scale 0.5, crf 26) — far lighter
+# than the AS001 4K chunks, so no chunking (timeout 180 min as a guard).
+# Trigger: pushing this file on john (2026-11-26: this file now lives on the
+# default branch of sandal5hw/c2v-render, so API dispatch works).
+# Output is uploaded as an Actions artifact named SC008-HawkEye360-sample.
+# NOTE: voice/master.wav is force-added to john (gitignored by default),
+# same as AS001's 45 MB master.wav — the runner copies it into render-public.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  # 样片、正片同时只能做一个（jo，2026-11-25）：全仓库渲染共用一个
+  # 并发组，一个在跑、其余排队；queue: max 保证排队的单不被后来者
+  # 顶掉（默认 single 只留最后一个等待者，会丢派发）。
+  group: c2v-render
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  render-sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Check disk and ffmpeg
+        run: |
+          df -h
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.18.3"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install headless Chrome for Remotion
+        run: npx remotion browser install
+
+      # render-public is gitignored (symlinks + master.wav hard link, built locally).
+      # Rebuild it on the runner the same way: assets symlinks, media symlink,
+      # master.wav copied from the committed voice dir.
+      - name: Rebuild render-public
+        run: |
+          mkdir -p projects/SC008-HawkEye360/render-public
+          cd projects/SC008-HawkEye360/render-public
+          ln -s ../../../assets/audio audio
+          ln -s ../../../assets/fonts fonts
+          ln -s ../../../assets/images images
+          ln -s ../research-package/media media
+          cp ../voice/master.wav master.wav
+          ls -la
+          test -f media/M-001_cia_hq_aerial.jpg && echo "M-001 resolves"
+
+      - name: Render sample (15900 frames, 960x540)
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR" output
+          ./node_modules/.bin/remotion render src/renderer/index.ts Documentary output/sample-lowres.mp4 --props=projects/SC008-HawkEye360/timeline/render-props.json --public-dir=projects/SC008-HawkEye360/render-public --scale=0.5 --crf=26 --frames=0-15899
+
+      - name: Verify sample
+        run: |
+          ls -la output/sample-lowres.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 output/sample-lowres.mp4
+          md5sum output/sample-lowres.mp4
+
+      - name: Upload sample
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC008-HawkEye360-sample
+          path: output/sample-lowres.mp4
+          retention-days: 1
+
+      - name: Generate effects sheet
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR"
+          sh scripts/effects_sheet.sh projects/SC008-HawkEye360
+
+      - name: Upload effects sheet
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC008-HawkEye360-effects-sheet
+          path: projects/SC008-HawkEye360/output/sheet/effects-sheet.png
+          retention-days: 1
+
+      # duck_check.py needs a music+SFX-only render (bgOnly: no voiceover).
+      - name: Render background-only audio (duck check)
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR" output
+          python3 -c "import json; p=json.load(open('projects/SC008-HawkEye360/timeline/render-props.json')); p['bgOnly']=True; json.dump(p, open('output/bg-props.json','w'), ensure_ascii=False)"
+          ./node_modules/.bin/remotion render src/renderer/index.ts Documentary output/bg-only.wav --props=output/bg-props.json --public-dir=projects/SC008-HawkEye360/render-public --codec=wav
+
+      - name: Upload background-only audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC008-HawkEye360-bg-audio
+          path: output/bg-only.wav
+          retention-days: 1
+
+      # Shared renderer code changed for SC008: SC001 regression stills
+      # (frames 0 / 300 / 9000 at sample scale) must still match SC001's
+      # delivered sample.
+      - name: SC001 regression stills
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR" output/sc001-stills projects/SC001-Colossal/render-public
+          cd projects/SC001-Colossal/render-public
+          ln -s ../../../assets/audio audio
+          ln -s ../../../assets/fonts fonts
+          ln -s ../../../assets/images images
+          ln -s ../research-package/media media
+          ln -s ../derived derived
+          # SC001's master.wav is not tracked in git (never force-added);
+          # stills are silent frames, so fall back to a silent placeholder.
+          if [ -f ../voice/master.wav ]; then
+            cp ../voice/master.wav master.wav
+          else
+            ffmpeg -v error -f lavfi -i anullsrc=r=8000:cl=mono -t 600 master.wav
+          fi
+          cd ../../..
+          for f in 0 300 9000; do
+            npx remotion still src/renderer/index.ts Documentary output/sc001-stills/f$f.png --props=projects/SC001-Colossal/timeline/render-props.json --public-dir=projects/SC001-Colossal/render-public --frame=$f --scale=0.5
+          done
+          ls -la output/sc001-stills
+
+      - name: Upload SC001 regression stills
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC001-regression-stills
+          path: output/sc001-stills
+          retention-days: 1
+
+  # 做完就清（jo，2026-11-25）：本次运行的 artifact 在交付物进 codev
+  # 后立即删除，不等保留期——免费存储只有 0.5 GB。只在渲染成功时
+  # 清；失败时保留（保留期已改 1 天）供排查。
+  cleanup-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: render-sample
+    if: success()
+    permissions:
+      actions: write
+    steps:
+      - name: Delete this run's artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[].id' | while read -r id; do
+            echo "Deleting artifact $id"
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id"
+          done
+          echo "Artifacts cleaned for run ${{ github.run_id }}."

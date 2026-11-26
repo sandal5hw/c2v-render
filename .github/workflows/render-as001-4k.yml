@@ -1,0 +1,153 @@
+name: Render AS001 4K
+
+# AS001-OffensiveAILab finished film, 4K 30fps.
+# Local VM restarts (~every 2h) kill the 3-4h render, so it runs here instead.
+# A single job cannot finish: the full render needs ~7h on the 2-core runner
+# (run 44430881580 reached 13952/16035 frames before the 6h job cap cancelled it).
+# So the film is rendered as 8 parallel chunk jobs (~50 min each), then a
+# concat job stitches them with ffmpeg -c copy and uploads the finished film.
+# Trigger: pushing this file on john (workflow_dispatch via API needs the file
+# on the default branch, and this workflow lives on john only — never main).
+# Output is uploaded as an Actions artifact named AS001-OffensiveAILab-4K.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  # 样片、正片同时只能做一个（jo，2026-11-25）：全仓库渲染共用一个
+  # 并发组，一个在跑、其余排队；queue: max 保证排队的单不被后来者
+  # 顶掉（默认 single 只留最后一个等待者，会丢派发）。
+  group: c2v-render
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  render-chunk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: "00"
+            frames: "0-1999"
+            count: 2000
+          - id: "01"
+            frames: "2000-3999"
+            count: 2000
+          - id: "02"
+            frames: "4000-5999"
+            count: 2000
+          - id: "03"
+            frames: "6000-7999"
+            count: 2000
+          - id: "04"
+            frames: "8000-9999"
+            count: 2000
+          - id: "05"
+            frames: "10000-11999"
+            count: 2000
+          - id: "06"
+            frames: "12000-13999"
+            count: 2000
+          - id: "07"
+            frames: "14000-16034"
+            count: 2035
+    steps:
+      - name: Checkout john
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          ref: john
+
+      - name: Check disk and ffmpeg
+        run: |
+          df -h
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.18.3"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install headless Chrome for Remotion
+        run: npx remotion browser install
+
+      # render-public is gitignored (symlinks + master.wav hard link, built locally).
+      # Rebuild it on the runner the same way: assets symlinks, media symlink,
+      # master.wav copied from the committed voice dir.
+      - name: Rebuild render-public
+        run: |
+          mkdir -p projects/AS001-OffensiveAILab/render-public
+          cd projects/AS001-OffensiveAILab/render-public
+          ln -s ../../../assets/audio audio
+          ln -s ../../../assets/fonts fonts
+          ln -s ../../../assets/images images
+          ln -s ../research-package/media media
+          cp ../voice/master.wav master.wav
+          ls -la
+          test -f images/thumb-h.jpg && echo "thumb-h.jpg resolves"
+
+      - name: Render chunk ${{ matrix.id }} (frames ${{ matrix.frames }})
+        env:
+          TMPDIR: ${{ github.workspace }}/tmp-remotion
+        run: |
+          mkdir -p "$TMPDIR" output
+          ./node_modules/.bin/remotion render src/renderer/index.ts Documentary output/chunk-${{ matrix.id }}.mp4 --props=projects/AS001-OffensiveAILab/timeline/render-props.json --public-dir=projects/AS001-OffensiveAILab/render-public --scale=2.0 --crf=18 --frames=${{ matrix.frames }}
+
+      - name: Verify chunk
+        run: |
+          ls -la output/chunk-${{ matrix.id }}.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 output/chunk-${{ matrix.id }}.mp4
+
+      - name: Upload chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.id }}
+          path: output/chunk-${{ matrix.id }}.mp4
+          retention-days: 7
+
+  concat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: render-chunk
+    steps:
+      - name: Check ffmpeg
+        run: |
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          ffmpeg -version | head -n 1
+
+      - name: Download chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          path: chunks
+
+      - name: Concatenate and verify
+        run: |
+          ls -la chunks/*/chunk-*.mp4
+          : > concat-list.txt
+          for i in 00 01 02 03 04 05 06 07; do
+            echo "file 'chunks/chunk-$i/chunk-$i.mp4'" >> concat-list.txt
+          done
+          cat concat-list.txt
+          mkdir -p output
+          ffmpeg -y -f concat -safe 0 -i concat-list.txt -c copy output/AS001-OffensiveAILab-4K.mp4
+          ls -la output/AS001-OffensiveAILab-4K.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,nb_frames,codec_name -show_entries stream=codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 output/AS001-OffensiveAILab-4K.mp4
+
+      - name: Upload 4K film
+        uses: actions/upload-artifact@v4
+        with:
+          name: AS001-OffensiveAILab-4K
+          path: output/AS001-OffensiveAILab-4K.mp4
+          retention-days: 7
