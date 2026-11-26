@@ -21,5 +21,6 @@ c2v 纪录片管线的渲染宿主仓库（2026-11-26 从 sandal5/c2v 迁出）�
 
 需要的仓库 Secrets（值不在本仓库任何文件里）：
 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`R2_TOKEN_ID`、
-`DIRECTOR_TOKEN`；`FISH_API_KEY` 可选（没有时 voice 工作流会从
+`DIRECTOR_TOKEN`、`C2V_READ_TOKEN`（拉取私有仓库 sandal5/c2v 的
+只读令牌）；`FISH_API_KEY` 可选（没有时 voice 工作流会从
 codev Worker 取）。

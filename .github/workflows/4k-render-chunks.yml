@@ -45,10 +45,14 @@ jobs:
       total_frames: ${{ steps.chunks.outputs.total_frames }}
     steps:
       - name: Checkout john
-        # 匿名克隆公开仓库 sandal5/c2v@john：actions/checkout 的 token
-        # 是本仓库的、拉不了跨仓库，置空又被 v4 拒绝；公开仓库直接
-        # 匿名 clone 最稳（2026-11-26 迁入 c2v-render 时改）。
-        run: git clone --depth 1 --branch john https://github.com/sandal5/c2v.git .
+        # c2v 是私有仓库（jo 2026-11-26 改回）：用只读令牌拉取。
+        # C2V_READ_TOKEN = fine-grained PAT，只授权 sandal5/c2v、
+        # Contents 只读，存在本仓库 Secrets 里。
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          token: ${{ secrets.C2V_READ_TOKEN }}
+          ref: john
 
       - name: Resolve project dir
         id: resolve
@@ -103,10 +107,14 @@ jobs:
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - name: Checkout john
-        # 匿名克隆公开仓库 sandal5/c2v@john：actions/checkout 的 token
-        # 是本仓库的、拉不了跨仓库，置空又被 v4 拒绝；公开仓库直接
-        # 匿名 clone 最稳（2026-11-26 迁入 c2v-render 时改）。
-        run: git clone --depth 1 --branch john https://github.com/sandal5/c2v.git .
+        # c2v 是私有仓库（jo 2026-11-26 改回）：用只读令牌拉取。
+        # C2V_READ_TOKEN = fine-grained PAT，只授权 sandal5/c2v、
+        # Contents 只读，存在本仓库 Secrets 里。
+        uses: actions/checkout@v4
+        with:
+          repository: sandal5/c2v
+          token: ${{ secrets.C2V_READ_TOKEN }}
+          ref: john
 
       - name: Check disk and ffmpeg
         run: |
