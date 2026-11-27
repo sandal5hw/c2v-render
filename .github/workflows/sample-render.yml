@@ -143,6 +143,7 @@ jobs:
           ln -s ../../../assets/audio audio
           ln -s ../../../assets/fonts fonts
           ln -s ../../../assets/images images
+          ln -s ../../../assets/video video
           if [ -d ../research-package/media ]; then
             ln -s ../research-package/media media
           fi

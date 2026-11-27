@@ -147,6 +147,7 @@ jobs:
           ln -s ../../../assets/audio audio
           ln -s ../../../assets/fonts fonts
           ln -s ../../../assets/images images
+          ln -s ../../../assets/video video
           ln -s ../research-package/media media
           cp ../voice/master.wav master.wav
           ls -la
